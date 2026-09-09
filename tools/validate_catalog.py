@@ -27,7 +27,65 @@ FOODS = {"EMPTY_STOMACH", "BEFORE_MEAL", "WITH_MEAL", "AFTER_MEAL"}
 # сочтёт файл испорченным и не станет заменять уже загруженный.
 MIN_ENTRIES = 20
 
-CATALOG = Path(__file__).resolve().parent.parent / "catalog" / "catalog_drugs.csv"
+ROOT = Path(__file__).resolve().parent.parent
+CATALOG = ROOT / "catalog" / "catalog_drugs.csv"
+GTIN = ROOT / "catalog" / "gtin.csv"
+
+# Столько же, сколько CatalogRepository.MIN_VALID_GTIN_ENTRIES.
+MIN_GTIN_ENTRIES = 10_000
+
+
+def check_gtin() -> int:
+    """Проверка таблицы кодов. Она собирается скриптом, поэтому проверяем
+    не построчно, а то, что могло сломаться при сборке: длину кода,
+    дубликаты и общее количество."""
+    if not GTIN.exists():
+        print(f"нет файла {GTIN}")
+        return 1
+
+    seen: dict[str, int] = {}
+    errors = 0
+    version = ""
+
+    for number, raw in enumerate(GTIN.read_text(encoding="utf-8").splitlines(), 1):
+        line = raw.strip()
+        if not line:
+            continue
+        if line.startswith("#"):
+            if not version and "version=" in line:
+                version = line.split("version=", 1)[1].split(" ")[0].strip()
+            continue
+        if line.startswith("gtin;"):
+            continue
+
+        parts = line.split(";")
+        gtin = parts[0].strip()
+        if len(gtin) != 14 or not gtin.isdigit():
+            print(f"gtin.csv:{number}: код «{gtin}» не 14 цифр")
+            errors += 1
+        elif gtin in seen:
+            print(f"gtin.csv:{number}: код {gtin} уже был в строке {seen[gtin]}")
+            errors += 1
+        else:
+            seen[gtin] = number
+
+        if len(parts) < 2 or not parts[1].strip():
+            print(f"gtin.csv:{number}: нет названия")
+            errors += 1
+
+        if errors > 20:
+            print("...слишком много ошибок, дальше не смотрю")
+            break
+
+    if len(seen) < MIN_GTIN_ENTRIES:
+        print(f"gtin.csv: кодов {len(seen)}, приложение примет от {MIN_GTIN_ENTRIES}")
+        errors += 1
+    if not version:
+        print("gtin.csv: в шапке нет «version=…»")
+        errors += 1
+
+    print(f"gtin.csv: версия {version or '—'}, кодов {len(seen)}, ошибок {errors}")
+    return 1 if errors else 0
 
 
 def main() -> int:
@@ -120,4 +178,4 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    sys.exit(main() or check_gtin())
