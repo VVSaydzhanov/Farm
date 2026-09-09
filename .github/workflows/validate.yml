@@ -1,0 +1,25 @@
+# Проверяет справочник при каждом пуше.
+#
+# Файл раздаётся приложениям напрямую с raw.githubusercontent.com: между
+# пушем в main и телефоном пользователя нет ни сборки, ни ревью. Поэтому
+# единственное место, где можно поймать битый файл, — здесь.
+name: Проверка справочника
+
+on:
+  push:
+    paths:
+      - 'catalog/**'
+      - 'tools/**'
+      - '.github/workflows/validate.yml'
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: python tools/validate_catalog.py

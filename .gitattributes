@@ -1,0 +1,5 @@
+# Приложение читает файл как UTF-8 с переводами строк LF.
+# Без этого Windows-клиент закоммитит CRLF, и в разборе появятся \r.
+*.csv text eol=lf
+*.md  text eol=lf
+*.py  text eol=lf
