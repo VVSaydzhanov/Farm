@@ -19,6 +19,9 @@ UNITS = {
     "PIECE", "MG", "G", "ML", "DROP", "PUFF", "IU", "SACHET",
     "APPLICATION", "OTHER",
 }
+# ANY здесь намеренно нет: «не важно» записывается пустым полем, а не словом,
+# иначе в файле не отличить «указания нет» от «указание есть, и оно любое».
+FOODS = {"EMPTY_STOMACH", "BEFORE_MEAL", "WITH_MEAL", "AFTER_MEAL"}
 
 # Столько же, сколько CatalogRepository.MIN_VALID_ENTRIES: меньше — приложение
 # сочтёт файл испорченным и не станет заменять уже загруженный.
@@ -63,7 +66,7 @@ def main() -> int:
         if len(parts) < 3:
             errors.append(f"строка {number}: меньше трёх колонок — {line!r}")
             continue
-        if len(parts) > 5:
+        if len(parts) > 6:
             errors.append(f"строка {number}: лишняя «;» в тексте — {line!r}")
             continue
 
@@ -94,6 +97,10 @@ def main() -> int:
             errors.append(f"строка {number}: неизвестная единица «{unit}»")
         if strength and not unit:
             warnings.append(f"строка {number}: дозировка без единицы измерения")
+
+        food = parts[5].strip() if len(parts) > 5 else ""
+        if food and food not in FOODS:
+            errors.append(f"строка {number}: недопустимая связь с едой «{food}»")
 
         count += 1
 
