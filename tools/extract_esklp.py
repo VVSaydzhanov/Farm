@@ -13,13 +13,23 @@
 source/gtin_manual.tsv, коды оттуда подмешиваются в итоговый файл и имеют
 приоритет над ЕСКЛП.
 
-Где взять исходник:
-    https://esklp.egisz.rosminzdrav.ru → Справочник ЕСКЛП в формате XML
-    → esklp_ГГГГММДД_active_*.xml (полная выгрузка активных записей)
+Где взять исходники — на портале ЕСКЛП есть два нужных XML:
+    active — только действующие записи (~55 МБ архив, ~1 ГБ внутри)
+    full   — действующие и исторические (~184 МБ архив, ~3,4 ГБ внутри)
+
+Берутся оба. Исторические записи дают около 2,5 тысяч кодов сверх active:
+регистрацию препарата давно прекратили, а упаковка у человека в тумбочке
+лежит, и штрихкод на ней рабочий. Сканеру её надо узнавать.
+
+Прямые ссылки (портал — одностраничное приложение, руками их не видно):
+    список:  /fs/public/list?createTimestamp=ГГГГ-ММ-ДД&section=esklp&exportFormat=XML
+    даты:    /fs/public/file_dates?year=ГГГГ
+    файл:    /fs/public/download/<fileId из списка>
 
 Запуск:
-    python tools/extract_esklp.py путь/к/esklp_..._active_....xml
-        полная пересборка: ЕСКЛП + ручные коды
+    python tools/extract_esklp.py active.xml full.xml
+        полная пересборка. Порядок важен: файл, указанный раньше,
+        перекрывает следующие, поэтому active идёт первым
 
     python tools/extract_esklp.py
         только подмешать ручные коды в уже собранный catalog/gtin.csv.
@@ -201,9 +211,11 @@ def write(rows: dict[str, list[str]], version: str, manual: dict[str, list[str]]
         "# Штрихкоды упаковок. Собирается скриптом tools/extract_esklp.py —\n"
         "# правьте исходники, а не этот файл.\n"
         "#\n"
-        "# Два источника:\n"
-        "#   ЕСКЛП (Минздрав) — только ЖНВЛП: штрихкод там лежит в блоке\n"
-        "#     предельных цен, а он заполняется лишь для препаратов из перечня;\n"
+        "# Источники:\n"
+        "#   ЕСКЛП (Минздрав), выгрузки active и full — только ЖНВЛП: штрихкод\n"
+        "#     там лежит в блоке предельных цен, а он заполняется лишь для\n"
+        "#     препаратов из перечня. Из full берутся исторические записи:\n"
+        "#     регистрация прекращена, а упаковка у человека осталась;\n"
         "#   source/gtin_manual.tsv — коды с упаковок, внесённые вручную\n"
         f"#     ({len(manual)} шт.): препараты вне перечня и БАДы.\n"
         "#\n"
@@ -255,14 +267,44 @@ def merge_only() -> int:
     return 0
 
 
-def main(path: Path) -> int:
-    text = path.read_text(encoding="utf-8", errors="replace")
+CHUNK = 8 << 20
 
-    rows: dict[str, list[str]] = {}
+
+def klp_blocks(path: Path):
+    """Выдавать блоки <ns2:klp> по одному, не поднимая файл в память.
+
+    Полная выгрузка с историческими записями — 3,4 ГБ в распакованном виде,
+    read_text() на ней съедает всю память. Читаем окном и отдаём только
+    целиком закрывшиеся блоки, хвост переносим в следующее окно.
+    """
+    tail = ""
+    with path.open(encoding="utf-8", errors="replace") as handle:
+        while True:
+            piece = handle.read(CHUNK)
+            if not piece:
+                break
+            tail += piece
+
+            last = 0
+            for match in KLP.finditer(tail):
+                yield match.group(0)
+                last = match.end()
+
+            if last:
+                tail = tail[last:]
+            elif len(tail) > 4 * CHUNK:
+                # Открывающего тега в окне нет вовсе — это не наш кусок
+                # файла (шапка, справочники), копить его незачем.
+                keep = tail.rfind("<ns2:klp")
+                tail = tail[keep:] if keep >= 0 else ""
+
+
+def collect(path: Path, rows: dict[str, list[str]]) -> tuple[int, int]:
+    """Разобрать выгрузку, добавив в rows только ещё не встреченные коды."""
     records = 0
+    before = len(rows)
 
-    for match in KLP.finditer(text):
-        chunk = match.group(0)
+    for chunk in klp_blocks(path):
         barcodes = BARCODE.findall(chunk)
         if not barcodes:
             continue
@@ -283,7 +325,21 @@ def main(path: Path) -> int:
             gtin = barcode.zfill(14)
             # Один и тот же код может встретиться у нескольких карточек;
             # берём первую — они описывают одну и ту же упаковку.
+            # Поэтому порядок файлов важен: активные записи идут раньше
+            # исторических и перекрывают их.
             rows.setdefault(gtin, [gtin, name, inn, form, strength, unit])
+
+    return records, len(rows) - before
+
+
+def main(paths: list[Path]) -> int:
+    rows: dict[str, list[str]] = {}
+    records = 0
+
+    for path in paths:
+        seen, added = collect(path, rows)
+        records += seen
+        print(f"{path.name}: карточек со штрихкодами {seen}, новых кодов {added}")
 
     from_esklp = len(rows)
 
@@ -292,7 +348,7 @@ def main(path: Path) -> int:
     manual = read_manual()
     rows.update(manual)
 
-    version = re.search(r"(\d{8})", path.name)
+    version = re.search(r"(\d{8})", paths[0].name)
     version = version.group(1) if version else "unknown"
     version = f"{version[:4]}-{version[4:6]}-{version[6:]}"
 
@@ -314,4 +370,4 @@ if __name__ == "__main__":
     if len(sys.argv) < 2:
         # Без выгрузки — значит, просто подмешать ручные коды.
         sys.exit(merge_only())
-    sys.exit(main(Path(sys.argv[1])))
+    sys.exit(main([Path(a) for a in sys.argv[1:]]))
