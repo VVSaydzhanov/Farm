@@ -26,9 +26,12 @@
 import argparse
 import json
 import shutil
+import ssl
 import subprocess
 import sys
 import tempfile
+import urllib.error
+import urllib.request
 import zipfile
 from datetime import date
 from pathlib import Path
@@ -36,6 +39,9 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 CATALOG = ROOT / "catalog" / "gtin.csv"
 TOOLS = ROOT / "tools"
+# Корень и промежуточные НУЦ Минцифры. Промежуточный истекает в 2027-м —
+# когда перестанет проверяться, связку надо обновить (как — в open_url).
+CA_BUNDLE = TOOLS / "russian_trusted_ca.pem"
 
 HOST = "https://esklp.egisz.rosminzdrav.ru"
 DATES = HOST + "/fs/public/file_dates?year={year}"
@@ -50,32 +56,48 @@ NEED_FREE_GB = 6
 TIMEOUT = 120
 
 
-def curl(url: str, *extra: str) -> subprocess.CompletedProcess:
-    """Ходить в сеть через curl, а не urllib — и вот почему.
+def ssl_context() -> ssl.SSLContext:
+    """Проверять сертификат ЕСКЛП по связке НУЦ Минцифры, а не по системной.
 
     Сервер ЕСКЛП отдаёт только конечный сертификат, без промежуточного,
-    а корень у него — российский удостоверяющий центр, которого нет
-    в связке OpenSSL/certifi. Python на этом спотыкается
-    (CERTIFICATE_VERIFY_FAILED), а curl достраивает цепочку из хранилища
-    Windows, где корень стоит, и проверку проходит честно.
+    а подписан он «Russian Trusted Sub CA» — корнем Минцифры, которого нет
+    ни в OpenSSL, ни в certifi. На Windows это обычно незаметно (корень
+    стоит в системном хранилище), на чистом Linux-сервере — падает сразу.
 
-    Отключать проверку сертификата ради этого нельзя: файл потом уезжает
+    Связка лежит рядом, в tools/russian_trusted_ca.pem. Так доверие
+    ограничено одним этим скриптом: ставить государственный корневой
+    сертификат в системное хранилище ради выгрузки справочника — чересчур,
+    после этого ему будут доверять вообще все программы на машине.
+
+    Отключать проверку нельзя ни при каком раскладе: собранный файл уезжает
     пользователям в приложение.
     """
-    result = subprocess.run(
-        ["curl", "-sS", "--fail", "--max-time", str(TIMEOUT), *extra, url],
-        capture_output=not extra,
-        text=not extra,
-        encoding="utf-8" if not extra else None,
-    )
-    if result.returncode != 0:
-        detail = (result.stderr or "").strip() if not extra else ""
-        raise SystemExit(f"не достучался до портала ЕСКЛП: {detail or 'curl ' + str(result.returncode)}")
-    return result
+    if CA_BUNDLE.exists():
+        return ssl.create_default_context(cafile=str(CA_BUNDLE))
+    print(f"внимание: нет {CA_BUNDLE.name}, проверяю по системному хранилищу")
+    return ssl.create_default_context()
+
+
+def open_url(url: str):
+    try:
+        return urllib.request.urlopen(url, timeout=TIMEOUT, context=ssl_context())
+    except urllib.error.URLError as error:
+        reason = getattr(error, "reason", error)
+        if isinstance(reason, ssl.SSLCertVerificationError):
+            raise SystemExit(
+                f"сертификат ЕСКЛП не прошёл проверку: {reason}\n"
+                f"Возможно, Минцифры сменили промежуточный сертификат — тогда\n"
+                f"обновите {CA_BUNDLE.name}: корень берётся с\n"
+                f"  https://gu-st.ru/content/Other/doc/russiantrustedca.pem\n"
+                f"промежуточный — по ссылке из самого сертификата (AIA):\n"
+                f"  http://nuc-cdp.digital.gov.ru/cdp/subca_ssl_rsa2024.crt"
+            )
+        raise SystemExit(f"не достучался до портала ЕСКЛП: {reason}")
 
 
 def fetch_json(url: str):
-    return json.loads(curl(url).stdout)
+    with open_url(url) as response:
+        return json.load(response)
 
 
 def latest_day() -> str:
@@ -105,7 +127,8 @@ def current_version() -> str:
 def download(file_id: str, name: str, into: Path) -> Path:
     target = into / f"{name}.zip"
     print(f"  качаю {name}...", flush=True)
-    curl(DOWNLOAD.format(file_id=file_id), "-o", str(target))
+    with open_url(DOWNLOAD.format(file_id=file_id)) as src, target.open("wb") as dst:
+        shutil.copyfileobj(src, dst, length=4 << 20)
 
     # Портал на несуществующий идентификатор отвечает JSON'ом с ошибкой,
     # а не кодом 404 — молча получить 153 байта вместо архива легко.
@@ -146,9 +169,6 @@ def main() -> int:
     parser.add_argument("--force", action="store_true", help="пересобрать даже без новой выгрузки")
     parser.add_argument("--no-push", action="store_true", help="закоммитить, но не пушить")
     options = parser.parse_args()
-
-    if not shutil.which("curl"):
-        raise SystemExit("нужен curl — он есть и в Windows, и в комплекте Git")
 
     day = latest_day()
     have = current_version()
