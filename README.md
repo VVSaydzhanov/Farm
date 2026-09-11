@@ -44,6 +44,27 @@ python tools/update_catalog.py
 и ничего не пушится**: приложение скачивает этот файл себе автоматически,
 поэтому лучше остаться на прошлой версии, чем разослать битую.
 
+#### По расписанию
+
+`tools/update_catalog.cmd` — обёртка для Планировщика заданий Windows:
+ставит рабочий каталог, кодировку вывода и пишет лог
+в `%LOCALAPPDATA%\pillbox-catalog-update.log`.
+
+```
+rem раз в месяц, 1-го числа в 10:00
+schtasks /create /tn "PillboxCatalogUpdate" /sc MONTHLY /d 1 /st 10:00 ^
+  /tr "\"E:\Devolop\Farm\tools\update_catalog.cmd\""
+
+rem прогнать сейчас, не дожидаясь расписания
+schtasks /run /tn "PillboxCatalogUpdate"
+
+rem посмотреть, когда отрабатывала
+schtasks /query /tn "PillboxCatalogUpdate" /v /fo LIST
+```
+
+Пуш из задачи работает без вопросов про пароль: учётные данные лежат
+в URL удалённого репозитория.
+
 Ниже — то же самое вручную, если понадобится разобраться.
 
 ---
