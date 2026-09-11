@@ -9,7 +9,9 @@
 
 Важное ограничение: штрихкоды в ЕСКЛП лежат в блоке предельных отпускных цен,
 а он заполняется только для ЖНВЛП. Препараты вне этого перечня и тем более
-БАДы штрихкодов в выгрузке не имеют — их код с упаковки не опознается.
+БАДы штрихкодов в выгрузке не имеют. Эти пробелы закрываются вручную —
+source/gtin_manual.tsv, коды оттуда подмешиваются в итоговый файл и имеют
+приоритет над ЕСКЛП.
 
 Где взять исходник:
     https://esklp.egisz.rosminzdrav.ru → Справочник ЕСКЛП в формате XML
@@ -17,6 +19,12 @@
 
 Запуск:
     python tools/extract_esklp.py путь/к/esklp_..._active_....xml
+        полная пересборка: ЕСКЛП + ручные коды
+
+    python tools/extract_esklp.py
+        только подмешать ручные коды в уже собранный catalog/gtin.csv.
+        Нужно, когда добавили пару БАДов и качать гигабайтную выгрузку
+        ради этого незачем.
 """
 
 import re
@@ -25,6 +33,8 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 OUT = ROOT / "catalog" / "gtin.csv"
+MANUAL = ROOT / "source" / "gtin_manual.tsv"
+COLUMNS = 6
 
 # Лекарственная форма ЕСКЛП -> константа MedicationForm.
 # Слева подстрока, поиск идёт по порядку: более узкие варианты выше.
@@ -117,6 +127,134 @@ def strength_of(text: str) -> tuple[str, str]:
     return "", ""
 
 
+def read_manual() -> dict[str, list[str]]:
+    """Коды, внесённые руками с упаковок на руках.
+
+    Строки проверяются строго и при ошибке роняют сборку: молча пропущенная
+    кривая строка означала бы, что человек считает код добавленным, а в
+    приложении его нет.
+    """
+    if not MANUAL.exists():
+        return {}
+
+    rows: dict[str, list[str]] = {}
+    for number, raw in enumerate(MANUAL.read_text(encoding="utf-8").splitlines(), 1):
+        line = raw.strip()
+        if not line or line.startswith("#") or line.startswith("gtin\t"):
+            continue
+
+        parts = raw.rstrip("\n").split("\t")
+        if len(parts) != COLUMNS:
+            raise SystemExit(
+                f"{MANUAL.name}, строка {number}: колонок {len(parts)}, "
+                f"а нужно {COLUMNS} (разделитель — табуляция)"
+            )
+
+        gtin, name = parts[0].strip(), parts[1].strip()
+        if not gtin.isdigit() or len(gtin) > 14:
+            raise SystemExit(f"{MANUAL.name}, строка {number}: код «{gtin}» — не 14 цифр")
+        if not name:
+            raise SystemExit(f"{MANUAL.name}, строка {number}: пустое название")
+        if ";" in raw:
+            raise SystemExit(
+                f"{MANUAL.name}, строка {number}: точка с запятой ломает CSV — уберите"
+            )
+
+        gtin = gtin.zfill(14)
+        rows[gtin] = [gtin] + [p.strip() for p in parts[1:]]
+
+    return rows
+
+
+def read_existing() -> dict[str, list[str]]:
+    """Уже собранный каталог — чтобы подмешать ручные коды без выгрузки."""
+    if not OUT.exists():
+        raise SystemExit(
+            f"{OUT} не найден. Для первой сборки нужна выгрузка ЕСКЛП — "
+            "запустите скрипт с путём к XML."
+        )
+
+    rows: dict[str, list[str]] = {}
+    for line in OUT.read_text(encoding="utf-8").splitlines():
+        if not line or line.startswith("#") or line.startswith("gtin;"):
+            continue
+        parts = line.split(";")
+        if len(parts) == COLUMNS:
+            rows[parts[0]] = parts
+    return rows
+
+
+MANUAL_MARKER = "# manual-gtins: "
+
+
+def write(rows: dict[str, list[str]], version: str, manual: dict[str, list[str]]) -> None:
+    lines = sorted(";".join(row) for row in rows.values())
+
+    # Коды из ручного файла перечисляются в шапке. Без этого пересборка
+    # без выгрузки ЕСКЛП умеет только добавлять: удалённую из исходника
+    # строку нечем опознать, и ошибочный код застрял бы в каталоге навсегда.
+    marker = (MANUAL_MARKER + ",".join(sorted(manual))).rstrip() + "\n"
+
+    header = (
+        f"# pillbox-gtin version={version} count={len(lines)}\n"
+        "#\n"
+        "# Штрихкоды упаковок. Собирается скриптом tools/extract_esklp.py —\n"
+        "# правьте исходники, а не этот файл.\n"
+        "#\n"
+        "# Два источника:\n"
+        "#   ЕСКЛП (Минздрав) — только ЖНВЛП: штрихкод там лежит в блоке\n"
+        "#     предельных цен, а он заполняется лишь для препаратов из перечня;\n"
+        "#   source/gtin_manual.tsv — коды с упаковок, внесённые вручную\n"
+        f"#     ({len(manual)} шт.): препараты вне перечня и БАДы.\n"
+        "#\n"
+        "# Код приведён к 14 знакам — так он приходит из кода маркировки.\n"
+        "#\n"
+        + marker
+        + "#\n"
+        "# Формат: код;название;действующее вещество;форма;дозировка;единица\n"
+        "gtin;name;inn;form;strength;unit\n"
+    )
+    OUT.write_text(header + "\n".join(lines) + "\n", encoding="utf-8", newline="\n")
+
+
+def merge_only() -> int:
+    """Режим без выгрузки: пересобрать каталог с текущим ручным файлом."""
+    head = OUT.read_text(encoding="utf-8")[:4096]
+    rows = read_existing()
+
+    # Сначала снимаем прошлую ручную порцию, потом кладём текущую —
+    # иначе удалённая из исходника строка осталась бы в каталоге.
+    previous = next(
+        (
+            line[len(MANUAL_MARKER):].strip()
+            for line in head.splitlines()
+            if line.startswith(MANUAL_MARKER)
+        ),
+        "",
+    )
+    dropped = 0
+    for gtin in filter(None, previous.split(",")):
+        if rows.pop(gtin, None) is not None:
+            dropped += 1
+
+    manual = read_manual()
+    rows.update(manual)
+
+    version = re.search(r"version=(\S+)", head)
+    write(rows, version.group(1) if version else "unknown", manual)
+
+    print(f"снято прошлых ручных кодов: {dropped}")
+    print(f"внесено ручных кодов: {len(manual)}")
+    print(f"всего в каталоге: {len(rows)}")
+    print(f"записано в {OUT} ({OUT.stat().st_size / 1048576:.1f} МБ)")
+    if dropped and not manual:
+        print(
+            "\nвнимание: ручной файл пуст. Если код был подменой записи ЕСКЛП,\n"
+            "она вернётся только полной пересборкой с выгрузкой."
+        )
+    return 0
+
+
 def main(path: Path) -> int:
     text = path.read_text(encoding="utf-8", errors="replace")
 
@@ -147,33 +285,24 @@ def main(path: Path) -> int:
             # берём первую — они описывают одну и ту же упаковку.
             rows.setdefault(gtin, [gtin, name, inn, form, strength, unit])
 
-    lines = [";".join(row) for row in rows.values()]
-    lines.sort()
+    from_esklp = len(rows)
+
+    # Ручные коды идут последними и перекрывают ЕСКЛП: они выверены
+    # по упаковке в руках, а выгрузка бывает неточной.
+    manual = read_manual()
+    rows.update(manual)
 
     version = re.search(r"(\d{8})", path.name)
     version = version.group(1) if version else "unknown"
     version = f"{version[:4]}-{version[4:6]}-{version[6:]}"
 
-    header = (
-        f"# pillbox-gtin version={version} count={len(lines)}\n"
-        "#\n"
-        "# Штрихкоды упаковок из ЕСКЛП (Минздрав). Собирается скриптом\n"
-        "# tools/extract_esklp.py — правьте исходник, а не этот файл.\n"
-        "#\n"
-        "# Только ЖНВЛП: в ЕСКЛП штрихкод лежит в блоке предельных цен,\n"
-        "# а он заполняется лишь для препаратов из перечня. Остальные\n"
-        "# лекарства и все БАДы по коду с упаковки не опознаются.\n"
-        "#\n"
-        "# Код приведён к 14 знакам — так он приходит из кода маркировки.\n"
-        "#\n"
-        "# Формат: код;название;действующее вещество;форма;дозировка;единица\n"
-        "gtin;name;inn;form;strength;unit\n"
-    )
-    OUT.write_text(header + "\n".join(lines) + "\n", encoding="utf-8", newline="\n")
+    write(rows, version, manual)
 
     with_form = sum(1 for r in rows.values() if r[3])
     with_strength = sum(1 for r in rows.values() if r[4])
     print(f"карточек со штрихкодами: {records}")
+    print(f"кодов из ЕСКЛП: {from_esklp}")
+    print(f"добавлено вручную: {len(manual)}")
     print(f"уникальных кодов: {len(rows)}")
     print(f"  из них с формой выпуска: {with_form}")
     print(f"  из них с дозировкой: {with_strength}")
@@ -183,6 +312,6 @@ def main(path: Path) -> int:
 
 if __name__ == "__main__":
     if len(sys.argv) < 2:
-        print(__doc__)
-        sys.exit(2)
+        # Без выгрузки — значит, просто подмешать ручные коды.
+        sys.exit(merge_only())
     sys.exit(main(Path(sys.argv[1])))
